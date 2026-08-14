@@ -61,6 +61,8 @@ from __future__ import annotations
 
 from harness.middleware import Middleware
 
+from harness.layers._quoting import quotes_a_line, source_doc
+
 
 class CitationChecker(Middleware):
     """Trỏ mỗi claim về đúng tài liệu thật sự chứa câu đó."""
@@ -68,16 +70,42 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        corpus = ctx.corpus
+        if not isinstance(claims, list) or not claims or corpus is None:
+            return report
+
+        observed = ctx.observed_text
+        rewritten = 0
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            doc_id = claim.get("doc_id")
+            cited = corpus.get(doc_id) if isinstance(doc_id, str) and doc_id else None
+            if cited is not None and quotes_a_line(text, cited.body):
+                continue  # trích dẫn đã đúng — không đụng vào
+
+            # Câu thật, tài liệu sai. Tìm nguồn THẬT trong những tài liệu
+            # lượt chạy đã đọc sạch, rồi CHỈ đổi doc_id. Không tìm được thì
+            # để nguyên cho `critic` (§2) quyết định xoá — bịa một doc_id ở
+            # đây là đổi lỗi 0.5 lấy lỗi 0.75 hoặc 1.5.
+            found = source_doc(corpus, text, observed)
+            if found is not None and found.doc_id != doc_id:
+                claim["doc_id"] = found.doc_id
+                rewritten += 1
+
+        ctx.state["citations_reattributed"] = rewritten
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in claims
+                if isinstance(claim, dict)
+                and isinstance(claim.get("doc_id"), str)
+                and claim["doc_id"]
+            }
+        )
+        return report

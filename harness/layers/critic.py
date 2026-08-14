@@ -72,6 +72,20 @@ from __future__ import annotations
 
 from harness.middleware import Middleware
 
+from harness.layers._quoting import norm, source_doc
+
+#: Chỗ mô hình dán hai nửa câu của hai tài liệu khác nhau — trường hợp (c).
+CONJUNCTION = " và "
+
+#: Câu thay thế khi không còn claim nào đứng vững. Cố tình KHÔNG dùng cụm
+#: "không đủ căn cứ": trên brief `is_synthesis` cụm đó thường là một phương
+#: án verdict được khai báo sẵn, và tự tay khẳng định thêm một phương án là
+#: cách biến một lượt chạy im lặng thành một lượt chạy đoán bừa.
+NO_EVIDENCE_ANSWER = (
+    "Chưa thu thập được bằng chứng đỡ cho một kết luận nào, nên tôi không "
+    "đưa ra khẳng định về câu hỏi này."
+)
+
 
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
@@ -79,16 +93,104 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept: list = []
+        dropped = 0
+        for claim in claims:
+            if not isinstance(claim, dict):
+                dropped += 1  # MALFORMED: phạt trọn 1.0, xoá rẻ hơn giữ
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                dropped += 1
+                continue
+
+            if _seen(ctx, text):
+                kept.append(claim)  # chữ thật — KHÔNG đụng vào text
+                continue
+
+            halves = _split_fused(ctx, claim, text)
+            if halves is not None:
+                # Hai nguồn mâu thuẫn. Nêu cả hai phía VÀ không chọn bên
+                # nào: trên brief `is_contradiction` cách này giữ trọn 15
+                # điểm honesty và recall lấy theo max(...) nên không bao
+                # giờ thiệt so với việc im lặng.
+                kept.extend(halves)
+                report["abstain"] = True
+                continue
+
+            dropped += 1  # không quan sát nào chứa câu này -> bịa
+
+        ctx.state["critic_dropped"] = dropped
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = NO_EVIDENCE_ANSWER
+            return report
+
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in kept
+                if isinstance(claim, dict)
+                and isinstance(claim.get("doc_id"), str)
+                and claim["doc_id"]
+            }
+        )
+        return report
+
+
+def _seen(ctx, text: str) -> bool:
+    """Câu này có nằm trong bằng chứng agent đã thực sự đọc không?
+
+    `ctx.saw` so khớp nguyên xi, đúng như docstring mô tả và đủ cho mock.
+    Bản chuẩn hoá đứng sau là để dành cho mô hình thật: nó có thể đổi hoa
+    thường hay gộp khoảng trắng khi chép lại, và scorer THA cho đúng hai
+    thứ đó. Xoá nhầm một claim mà scorer vốn định cho điểm cũng đắt như
+    giữ lại một claim bịa.
+    """
+    if ctx.saw(text):
+        return True
+    normalised = norm(text)
+    return bool(normalised) and normalised in norm(ctx.observed_text)
+
+
+def _split_fused(ctx, claim: dict, text: str):
+    """Tách câu ghép của trường hợp (c), hoặc `None` nếu không tách được.
+
+    Cắt tại chỗ dán (" và ") và chỉ chấp nhận khi CẢ HAI nửa đều là trích
+    dẫn nguyên văn một dòng của HAI tài liệu KHÁC NHAU đã đọc sạch. Hai
+    nửa vẫn là substring của chữ mô hình viết, nên vẫn qua được kiểm tra
+    provenance — cắt thì được, sửa thì không.
+    """
+    corpus = getattr(ctx, "corpus", None)
+    if corpus is None:
+        return None
+
+    observed = ctx.observed_text
+    start = 0
+    while True:
+        pos = text.find(CONJUNCTION, start)
+        if pos < 0:
+            return None
+        start = pos + 1
+
+        left = text[:pos].strip()
+        right = text[pos + len(CONJUNCTION):].strip()
+        left_doc = source_doc(corpus, left, observed)
+        right_doc = source_doc(corpus, right, observed)
+        if left_doc is None or right_doc is None:
+            continue
+        if left_doc.doc_id == right_doc.doc_id:
+            # Cùng một tài liệu nghĩa là cắt sai chỗ: câu này vốn không bị
+            # ghép từ hai nguồn. Thử chỗ dán tiếp theo.
+            continue
+
+        return [
+            {**claim, "text": left, "doc_id": left_doc.doc_id},
+            {**claim, "text": right, "doc_id": right_doc.doc_id},
+        ]

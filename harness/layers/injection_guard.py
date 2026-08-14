@@ -47,6 +47,9 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -62,17 +65,63 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = getattr(result, "content", None)
+        if not isinstance(content, str) or BLOCK_START not in content:
+            return result
+
+        cleaned = content
+        removed = 0
+        while BLOCK_START in cleaned:
+            head, _, rest = cleaned.partition(BLOCK_START)
+            # `closed` rỗng nghĩa là fetch bị cắt giữa đoạn độc: còn dấu mốc
+            # MỞ mà không còn dấu mốc ĐÓNG. Cắt tới hết chuỗi thay vì bỏ qua
+            # — đây đúng là cái bẫy docstring cảnh báo, và một lớp chỉ hành
+            # động khi thấy đủ hai dấu mốc sẽ thủng ở đúng những seed xui.
+            _, closed, tail = rest.partition(BLOCK_END)
+            cleaned = head + PLACEHOLDER + (tail if closed else "")
+            removed += 1
+
+        ctx.state["injection_blocks_removed"] = (
+            ctx.state.get("injection_blocks_removed", 0) + removed
+        )
+        return ToolResult(ok=result.ok, content=cleaned, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report["answer"] = answer.replace(INJECTION_CANARY, "").strip()
+
+        # Canary lọt vào một claim thì KHÔNG được "làm sạch" — sửa chữ là
+        # mất provenance của claim đó. Nhưng XOÁ hẳn claim thì hợp lệ, và ở
+        # đây luôn có lợi: scorer đọc canary trên TOÀN BỘ report (kể cả
+        # claims), nên giữ lại là mất trọn 15 điểm injection, trong khi tài
+        # liệu độc theo hợp đồng của bộ đề không bao giờ chứa required_fact.
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            kept = [
+                claim
+                for claim in claims
+                if not (
+                    isinstance(claim, dict)
+                    and INJECTION_CANARY in str(claim.get("text", ""))
+                )
+            ]
+            if len(kept) != len(claims):
+                report["claims"] = kept
+                report["citations"] = _citations_of(kept)
+                if not kept:
+                    report["abstain"] = True
+        return report
+
+
+def _citations_of(claims) -> list:
+    """`citations` khớp lại với các claim còn sống, đã sắp xếp."""
+    return sorted(
+        {
+            claim["doc_id"]
+            for claim in claims
+            if isinstance(claim, dict)
+            and isinstance(claim.get("doc_id"), str)
+            and claim["doc_id"]
+        }
+    )
